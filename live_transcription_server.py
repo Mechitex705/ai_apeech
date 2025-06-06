@@ -1,106 +1,130 @@
 import asyncio
-from pyexpat import model
 import websockets
-import openai
 import tempfile
 import datetime
 import json
 import os
-import subprocess
+import wave
+import logging
+from openai import OpenAI
+from dotenv import load_dotenv
 
-# Set your OpenAI API key
-openai.api_key = 'YOUR_OPENAI_API_KEY'
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# OpenWebSocket connected clients
+# Load environment variables
+load_dotenv()
+
+# Initialize OpenAI client
+client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
 connected_clients = set()
 
-async def transcribe_audio_chunk(audio_bytes):
-    # Save WebM audio chunk to a temporary file
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp_in:
-        tmp_in.write(audio_bytes)
-        tmp_in.flush()
-        in_path = tmp_in.name
+def create_valid_wav(audio_bytes, sample_rate=16000):
+    """Convert raw audio bytes to properly formatted WAV file"""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+            with wave.open(tmp_file, 'wb') as wav:
+                wav.setnchannels(1)  # Mono
+                wav.setsampwidth(2)  # 16-bit
+                wav.setframerate(sample_rate)  # 16kHz
+                wav.writeframes(audio_bytes)
+            return tmp_file.name
+    except Exception as e:
+        logger.error(f"WAV creation failed: {e}")
+        raise
 
-    # Convert WebM to WAV for Whisper
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_out:
-        out_path = tmp_out.name
-    tmp_out.close()
+async def transcribe_audio_chunk(audio_bytes):
+    """Process audio chunk through Whisper API"""
+    # Minimum size check (0.1s of 16kHz 16-bit mono = 3200 bytes)
+    if len(audio_bytes) < 3200:
+        logger.warning("Audio chunk too short (min 0.1s required)")
+        return None
 
     try:
-        # Use ffmpeg to convert WebM to 16kHz mono WAV
-        cmd = [
-            "ffmpeg",
-            "-y",  # Overwrite output file without asking
-            "-i", in_path,  # Input file (WebM)
-            "-ar", "16000",  # Sample rate 16kHz
-            "-ac", "1",  # Mono channel
-            out_path  # Output file (WAV)
-        ]
-        
-        # Run the subprocess and capture stdout and stderr
-        result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        wav_path = create_valid_wav(audio_bytes)
+        logger.debug(f"Created WAV file at {wav_path}")
 
-        # Log stdout and stderr for debugging
-        print("[FFmpeg Output]:", result.stdout.decode(errors="ignore"))
-        print("[FFmpeg Error]:", result.stderr.decode(errors="ignore"))
-
-        # Run Whisper transcription on the WAV file
-        result = model.transcribe(out_path)
-        return result["text"]
-
-    except subprocess.CalledProcessError as e:
-        print("[FFmpeg Error]:", e.stderr.decode(errors="ignore"))
-        return "[ERROR] Audio conversion failed"
-
-    except openai.error.APIError as e:
-        print(f"OpenAI API error: {e}")
-        return "[ERROR] Transcription failed"
-
+        with open(wav_path, 'rb') as audio_file:
+            response = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="text"
+            )
+            return response
     except Exception as e:
-        print(f"Unexpected error: {e}")
-        return "[ERROR] Transcription failed"
-
+        logger.error(f"Transcription failed: {str(e)}")
+        return None
     finally:
-        # Clean up the temporary files (WebM and WAV)
-        for f in (in_path, out_path):
-            try:
-                os.remove(f)
-            except Exception as e:
-                print(f"Error cleaning up file {f}: {str(e)}")
+        try:
+            os.unlink(wav_path)
+        except:
+            pass
 
-async def handler(websocket):
+async def handler(websocket, path=None):
+    """Handle WebSocket connections"""
     connected_clients.add(websocket)
-    print(f"Client connected: {websocket.remote_address}")
+    client_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
+    logger.info(f"New connection from {client_ip}")
 
     try:
         async for message in websocket:
             if isinstance(message, bytes):
-                # Received audio chunk as bytes, transcribe it
+                # Process audio chunk
                 transcript = await transcribe_audio_chunk(message)
-                if transcript.strip():
-                    data = {
+                
+                if transcript:
+                    response = {
                         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                        "transcript": transcript
+                        "transcript": transcript,
+                        "client": client_ip
                     }
-                    msg = json.dumps(data)
+                    msg = json.dumps(response)
 
-                    # Broadcast to all other clients (except sender)
-                    await asyncio.gather(*[
-                        client.send(msg)
-                        for client in connected_clients
-                        if client != websocket and not client.closed
-                    ])
-    except websockets.ConnectionClosed:
-        print(f"Client disconnected: {websocket.remote_address}")
+                    # Broadcast to other clients (using connection state tracking)
+                    tasks = []
+                    for client in connected_clients:
+                        if client != websocket:
+                            try:
+                                tasks.append(client.send(msg))
+                            except:
+                                connected_clients.discard(client)
+                    if tasks:
+                        await asyncio.gather(*tasks)
+    except websockets.exceptions.ConnectionClosed:
+        logger.info(f"Client {client_ip} disconnected")
     except Exception as e:
-        print(f"[Handler Error]: {str(e)}")
+        logger.error(f"Handler error: {str(e)}")
     finally:
-        connected_clients.remove(websocket)
+        connected_clients.discard(websocket)
 
 async def main():
-    print("WebSocket server running at ws://localhost:8765")
-    async with websockets.serve(handler, "localhost", 8765):  # Ensure localhost
-        await asyncio.Future()  # run forever
+    """Start WebSocket server"""
+    logger.info("Starting server on ws://localhost:8765")
+    async with websockets.serve(
+        handler,
+        "localhost",
+        8765,
+        ping_interval=30,
+        ping_timeout=30,
+        close_timeout=10
+    ):
+        await asyncio.Future()  # Run forever
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Verify environment
+    if not os.getenv('OPENAI_API_KEY'):
+        logger.error("Missing OPENAI_API_KEY in environment")
+        exit(1)
+
+    # Run server
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Server stopped by user")
+    except Exception as e:
+        logger.error(f"Server crashed: {str(e)}")
