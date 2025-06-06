@@ -160,75 +160,262 @@ if (!$class) {
 <script>
 let mediaRecorder;
 let socket;
+let audioContext;
+let analyser;
+let audioChunks = [];
+let lastSendTime = Date.now();
 
 const startBtn = document.getElementById('startTranscription');
 const stopBtn = document.getElementById('stopTranscription');
 const statusDiv = document.getElementById('transcriptionStatus');
 const transcriptContainer = document.getElementById('transcriptContainer');
+const transcriptionOutput = document.getElementById('transcriptionOutput');
+const audioLevelMeter = document.getElementById('audioLevel');
 
 const classId = <?= json_encode($class_id) ?>;
 
+// Initialize UI
+document.addEventListener('DOMContentLoaded', function() {
+  // Initialize any dashboard components here
+  const sparklineEl = document.getElementById('sparkline-element');
+  if (sparklineEl) {
+    try {
+      new Sparkline(sparklineEl);
+    } catch (e) {
+      console.error('Sparkline initialization failed:', e);
+    }
+  }
+});
+
 startBtn.onclick = async () => {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    alert('Your browser does not support audio capture.');
+    showAlert('Your browser does not support audio capture.', 'danger');
     return;
   }
 
-  // Connect to the WebSocket server
-  socket = new WebSocket('ws://localhost:8765');
-
-  socket.onopen = () => {
-    statusDiv.textContent = 'Connected to transcription server.';
-  };
-
-  socket.onclose = () => {
-    statusDiv.textContent = 'Disconnected from transcription server.';
-  };
-
-  socket.onerror = (e) => {
-    console.error('WebSocket error', e);
-    statusDiv.textContent = 'WebSocket error occurred.';
-  };
-
   try {
-    // Request microphone access
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // Clear previous transcripts
+    transcriptionOutput.innerHTML = '';
+    
+    // Connect to WebSocket
+    setupWebSocket();
 
-    // Use MediaRecorder to capture audio in WebM format (audio/webm is widely supported)
-    mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+    // Request microphone access with optimal settings
+    const stream = await navigator.mediaDevices.getUserMedia({ 
+      audio: {
+        sampleRate: 16000,
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      },
+      video: false
+    });
 
-    mediaRecorder.ondataavailable = async (event) => {
-      if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
-        // Log the audio chunk size for debugging
-        console.log("Audio chunk size:", event.data.size);
+    // Set up audio visualization
+    setupAudioMeter(stream);
 
-        // Convert the audio chunk into ArrayBuffer and send over WebSocket
-        const buffer = await event.data.arrayBuffer();
-        socket.send(buffer);  // Send raw WebM audio to server
-      }
-    };
+    // Configure media recorder
+    mediaRecorder = new MediaRecorder(stream, { 
+      mimeType: 'audio/webm;codecs=opus',
+      audioBitsPerSecond: 16000
+    });
 
-    // Start recording and send chunks every 2 seconds
-    mediaRecorder.start(2000);
+    // Handle audio data
+    mediaRecorder.ondataavailable = handleAudioData;
+    
+    // Start recording with small timeslice for frequent updates
+    mediaRecorder.start(100);
 
+    // Update UI
     startBtn.disabled = true;
     stopBtn.disabled = false;
     transcriptContainer.style.display = 'block';
     statusDiv.textContent = 'Recording...';
+    statusDiv.className = 'text-success';
+
   } catch (err) {
-    alert('Error accessing microphone: ' + err.message);
+    handleError('Error accessing microphone: ' + err.message, err);
+    if (socket) socket.close();
   }
 };
 
 stopBtn.onclick = () => {
+  try {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.stream.getTracks().forEach(track => track.stop());
+      mediaRecorder.stop();
+    }
+    if (socket) {
+      socket.close();
+    }
+    if (audioContext) {
+      audioContext.close();
+    }
+    
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    statusDiv.textContent = 'Stopped.';
+    statusDiv.className = 'text-muted';
+    
+  } catch (err) {
+    handleError('Error stopping recording: ' + err.message, err);
+  }
+};
+
+// WebSocket Functions
+function setupWebSocket() {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${protocol}//${window.location.hostname}:8765`;
+  
+  socket = new WebSocket(wsUrl);
+
+  socket.onopen = () => {
+    console.log('WebSocket connection established');
+    statusDiv.textContent = 'Connected to transcription server';
+    statusDiv.className = 'text-success';
+  };
+
+  socket.onclose = (event) => {
+    console.log('WebSocket closed:', event);
+    statusDiv.textContent = `Disconnected: ${event.reason || 'Connection closed'}`;
+    statusDiv.className = 'text-danger';
+    
+    // Attempt reconnect if we were recording
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      setTimeout(setupWebSocket, 2000);
+    }
+  };
+
+  socket.onerror = (error) => {
+    console.error('WebSocket error:', error);
+    statusDiv.textContent = 'WebSocket error occurred';
+    statusDiv.className = 'text-danger';
+  };
+
+  socket.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.transcript) {
+        addTranscriptSegment(data.transcript, data.timestamp);
+      }
+    } catch (e) {
+      console.error('Error processing message:', e);
+    }
+  };
+}
+
+// Audio Processing Functions
+function setupAudioMeter(stream) {
+  audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  analyser = audioContext.createAnalyser();
+  analyser.fftSize = 32;
+  const source = audioContext.createMediaStreamSource(stream);
+  source.connect(analyser);
+  
+  const updateMeter = () => {
+    const array = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(array);
+    const avg = array.reduce((a, b) => a + b) / array.length;
+    const level = Math.min(100, Math.max(0, avg));
+    audioLevelMeter.style.width = `${level}%`;
+    
+    // Color feedback (green/yellow/red)
+    if (level < 30) {
+      audioLevelMeter.className = 'progress-bar bg-danger';
+    } else if (level < 70) {
+      audioLevelMeter.className = 'progress-bar bg-warning';
+    } else {
+      audioLevelMeter.className = 'progress-bar bg-success';
+    }
+    
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      requestAnimationFrame(updateMeter);
+    }
+  };
+  
+  updateMeter();
+}
+
+async function handleAudioData(event) {
+  if (event.data.size > 0) {
+    audioChunks.push(event.data);
+    
+    // Send every 2 seconds or when 50kb is reached
+    if (audioChunks.length > 0 && (Date.now() - lastSendTime > 2000 || 
+        audioChunks.reduce((a, b) => a + b.size, 0) > 50000)) {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        try {
+          const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+          const buffer = await audioBlob.arrayBuffer();
+          socket.send(buffer);
+          console.log("Sent audio chunk:", buffer.byteLength, "bytes");
+        } catch (e) {
+          console.error('Error sending audio:', e);
+        }
+      }
+      audioChunks = [];
+      lastSendTime = Date.now();
+    }
+  }
+}
+
+// UI Functions
+function addTranscriptSegment(text, timestamp) {
+  const segment = document.createElement('div');
+  segment.className = 'transcript-segment high-confidence';
+  
+  const time = new Date(timestamp);
+  const timeString = time.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+  
+  segment.innerHTML = `
+    <div class="transcript-text">${escapeHtml(text)}</div>
+    <div class="segment-meta">
+      <span>${timeString}</span>
+      <span class="confidence-badge">High confidence</span>
+    </div>
+  `;
+  
+  transcriptionOutput.appendChild(segment);
+  transcriptionOutput.scrollTop = transcriptionOutput.scrollHeight;
+}
+
+function showAlert(message, type = 'danger') {
+  const alertDiv = document.createElement('div');
+  alertDiv.className = `alert alert-${type} alert-dismissible fade show mt-3`;
+  alertDiv.innerHTML = `
+    ${message}
+    <button type="button" class="close" data-dismiss="alert" aria-label="Close">
+      <span aria-hidden="true">&times;</span>
+    </button>
+  `;
+  statusDiv.appendChild(alertDiv);
+  
+  setTimeout(() => {
+    alertDiv.classList.remove('show');
+    setTimeout(() => alertDiv.remove(), 150);
+  }, 5000);
+}
+
+function handleError(message, error) {
+  console.error(message, error);
+  showAlert(message, 'danger');
+}
+
+function escapeHtml(unsafe) {
+  return unsafe
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+// Cleanup on page exit
+window.addEventListener('beforeunload', () => {
+  if (socket) socket.close();
   if (mediaRecorder && mediaRecorder.state !== 'inactive') {
     mediaRecorder.stop();
   }
-  if (socket) {
-    socket.close();
-  }
-  startBtn.disabled = false;
-  stopBtn.disabled = true;
-  statusDiv.textContent = 'Stopped.';
-};
+});
 </script>
